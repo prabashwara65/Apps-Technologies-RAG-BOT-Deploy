@@ -1,0 +1,506 @@
+import { apiBaseUrl, authHeaders, jsonHeaders } from "./http";
+import { setAccessToken } from "./session";
+
+export type UserRole = "user" | "admin" | "hr" | "employee" | "student";
+
+export type ThemePreference = "light" | "dark" | "system";
+export type TwoFactorMethod = "none" | "email_otp" | "totp";
+
+export interface Profile {
+  id: string;
+  email: string;
+  display_name: string;
+  theme: ThemePreference;
+  has_avatar: boolean;
+  avatar_filename?: string | null;
+  two_factor_method: TwoFactorMethod;
+  role?: UserRole;
+}
+
+export interface TotpSetup {
+  secret: string;
+  otpauth_uri: string;
+  qr_svg: string;
+}
+
+export type LoginResult =
+  | { kind: "email_otp"; issued: OtpIssued }
+  | { kind: "totp"; email: string }
+  | { kind: "session"; session: SessionPayload };
+
+export interface OtpIssued {
+  otp_sent: boolean;
+  email: string;
+  expires_in_seconds: number;
+  otp_code: string | null;
+  delivery: "email" | "on_screen";
+}
+
+export interface SessionPayload {
+  access_token: string;
+  token_type: string;
+  user: Profile;
+}
+
+export type AuthFailureKind =
+  | "network"
+  | "invalid_request"
+  | "conflict"
+  | "not_found"
+  | "unauthenticated"
+  | "mail_failed"
+  | "rate_limited"
+  | "unexpected";
+
+export class AuthApiError extends Error {
+  readonly kind: AuthFailureKind;
+  readonly code: string | null;
+
+  constructor(
+    kind: AuthFailureKind,
+    message = AUTH_FAILURE_MESSAGES[kind],
+    code: string | null = null,
+  ) {
+    super(message);
+    this.name = "AuthApiError";
+    this.kind = kind;
+    this.code = code;
+  }
+}
+
+function failureKind(status: number): AuthFailureKind {
+  if (status === 401) {
+    return "unauthenticated";
+  }
+  if (status === 404) {
+    return "not_found";
+  }
+  if (status === 409) {
+    return "conflict";
+  }
+  if (status === 422 || status === 400) {
+    return "invalid_request";
+  }
+  if (status === 413) {
+    return "invalid_request";
+  }
+  if (status === 429) {
+    return "rate_limited";
+  }
+  if (status === 502) {
+    return "mail_failed";
+  }
+  return "unexpected";
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    if (!response.ok) {
+      return null;
+    }
+    throw new AuthApiError("unexpected");
+  }
+}
+
+function serverErrorMessage(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null || !("error" in payload)) {
+    return null;
+  }
+  const error = payload.error;
+  if (typeof error !== "object" || error === null || !("message" in error)) {
+    return null;
+  }
+  return typeof error.message === "string" && error.message.trim()
+    ? error.message
+    : null;
+}
+
+function serverErrorCode(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null || !("error" in payload)) {
+    return null;
+  }
+  const error = payload.error;
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return null;
+  }
+  return typeof error.code === "string" && error.code.trim()
+    ? error.code
+    : null;
+}
+
+function authError(response: Response, payload: unknown): AuthApiError {
+  if (response.status >= 500) {
+    return new AuthApiError("unexpected");
+  }
+  return new AuthApiError(
+    failureKind(response.status),
+    response.status >= 400 ? (serverErrorMessage(payload) ?? undefined) : undefined,
+    response.status >= 400 ? serverErrorCode(payload) : null,
+  );
+}
+
+export function isProfile(value: unknown): value is Profile {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<Profile>;
+  return (
+    (candidate.role === undefined ||
+      ["user", "admin", "hr", "employee", "student"].includes(candidate.role)) &&
+    typeof candidate.id === "string" &&
+    typeof candidate.email === "string" &&
+    typeof candidate.display_name === "string" &&
+    (candidate.theme === "light" ||
+      candidate.theme === "dark" ||
+      candidate.theme === "system") &&
+    typeof candidate.has_avatar === "boolean"
+  );
+}
+
+function withTwoFactorMethod(value: Profile): Profile {
+  const method = (value as Partial<Profile>).two_factor_method;
+  if (method === "none" || method === "email_otp" || method === "totp") {
+    return value;
+  }
+  return { ...value, two_factor_method: "email_otp" };
+}
+
+function isOtpIssued(value: unknown): value is OtpIssued {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<OtpIssued> & { delivery?: string };
+  if (
+    candidate.otp_sent !== true ||
+    typeof candidate.email !== "string" ||
+    typeof candidate.expires_in_seconds !== "number" ||
+    !(candidate.otp_code === null || typeof candidate.otp_code === "string")
+  ) {
+    return false;
+  }
+  if (candidate.delivery === "email" || candidate.delivery === "on_screen") {
+    return true;
+  }
+  candidate.delivery = candidate.otp_code === null ? "email" : "on_screen";
+  return true;
+}
+
+function isTotpSetup(value: unknown): value is TotpSetup {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<TotpSetup>;
+  return (
+    typeof candidate.secret === "string" &&
+    candidate.secret.length > 0 &&
+    typeof candidate.otpauth_uri === "string" &&
+    candidate.otpauth_uri.startsWith("otpauth://") &&
+    typeof candidate.qr_svg === "string" &&
+    candidate.qr_svg.trimStart().startsWith("<svg")
+  );
+}
+
+function parseLoginResult(value: unknown): LoginResult | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const candidate = value as { next_step?: string; email?: string };
+  if (candidate.next_step === "totp" && typeof candidate.email === "string") {
+    return { kind: "totp", email: candidate.email };
+  }
+  if (candidate.next_step === "session" && isSessionPayload(value)) {
+    return { kind: "session", session: { ...value, user: withTwoFactorMethod(value.user) } };
+  }
+  if (isOtpIssued(value)) {
+    return { kind: "email_otp", issued: value };
+  }
+  if (isSessionPayload(value)) {
+    return { kind: "session", session: { ...value, user: withTwoFactorMethod(value.user) } };
+  }
+  return null;
+}
+
+function isSessionPayload(value: unknown): value is SessionPayload {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<SessionPayload>;
+  return (
+    typeof candidate.access_token === "string" &&
+    typeof candidate.token_type === "string" &&
+    isProfile(candidate.user)
+  );
+}
+
+async function postAuth(path: string, body: unknown): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}${path}`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw authError(response, payload);
+  }
+  return payload;
+}
+
+export async function requestSignup(
+  email: string,
+  displayName: string,
+  password: string,
+): Promise<OtpIssued> {
+  const payload = await postAuth("/api/v1/auth/signup", {
+    email,
+    display_name: displayName,
+    password,
+  });
+  if (!isOtpIssued(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  return payload;
+}
+
+export async function requestLogin(email: string, password: string): Promise<LoginResult> {
+  const payload = await postAuth("/api/v1/auth/login", { email, password });
+  const result = parseLoginResult(payload);
+  if (result === null) {
+    throw new AuthApiError("unexpected");
+  }
+  if (result.kind === "session") {
+    setAccessToken(result.session.access_token);
+  }
+  return result;
+}
+
+export async function requestResetPassword(
+  email: string,
+  newPassword: string,
+): Promise<OtpIssued> {
+  const payload = await postAuth("/api/v1/auth/reset-password", {
+    email,
+    new_password: newPassword,
+  });
+  if (!isOtpIssued(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  return payload;
+}
+
+export async function verifyOtp(email: string, code: string): Promise<SessionPayload> {
+  const payload = await postAuth("/api/v1/auth/verify", { email, code });
+  if (!isSessionPayload(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  setAccessToken(payload.access_token);
+  return { ...payload, user: withTwoFactorMethod(payload.user) };
+}
+
+export async function verifyTotp(email: string, code: string): Promise<SessionPayload> {
+  const payload = await postAuth("/api/v1/auth/verify-totp", { email, code });
+  if (!isSessionPayload(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  setAccessToken(payload.access_token);
+  return { ...payload, user: withTwoFactorMethod(payload.user) };
+}
+
+export async function fetchProfile(): Promise<Profile> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me`, {
+      headers: authHeaders(),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw authError(response, payload);
+  }
+  if (!isProfile(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  return withTwoFactorMethod(payload);
+}
+
+export async function updateProfile(patch: {
+  display_name?: string;
+  theme?: ThemePreference;
+}): Promise<Profile> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me`, {
+      method: "PATCH",
+      headers: jsonHeaders(),
+      body: JSON.stringify(patch),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw authError(response, payload);
+  }
+  if (!isProfile(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  return withTwoFactorMethod(payload);
+}
+
+export function avatarUrlFor(userId: string): string {
+  return `${apiBaseUrl()}/api/v1/me/avatar/${encodeURIComponent(userId)}`;
+}
+
+export async function uploadAvatar(blob: Blob): Promise<{ avatar_url: string }> {
+  const body = new FormData();
+  body.append("file", blob, "avatar.png");
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me/avatar`, {
+      method: "POST",
+      headers: authHeaders(),
+      body,
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  const payload = await readJson(response);
+  if (!response.ok) throw authError(response, payload);
+  if (typeof payload !== "object" || payload === null ||
+      !("avatar_url" in payload) || typeof payload.avatar_url !== "string") {
+    throw new AuthApiError("unexpected");
+  }
+  return { avatar_url: payload.avatar_url };
+}
+
+export async function removeAvatar(): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me/avatar`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  if (!response.ok) throw authError(response, await readJson(response));
+}
+
+// Keep the existing exported name available to callers.
+export const deleteAvatar = removeAvatar;
+
+async function postProfile(path: string, body: unknown): Promise<Profile> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}${path}`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw new AuthApiError(failureKind(response.status));
+  }
+  if (!isProfile(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  return withTwoFactorMethod(payload);
+}
+
+export async function setTwoFactorMethod(method: "none" | "email_otp"): Promise<Profile> {
+  return postProfile("/api/v1/me/two-factor", { method });
+}
+
+export async function beginTotpSetup(): Promise<TotpSetup> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me/two-factor/totp`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw new AuthApiError(failureKind(response.status));
+  }
+  if (!isTotpSetup(payload)) {
+    throw new AuthApiError("unexpected");
+  }
+  return payload;
+}
+
+export async function confirmTotpSetup(code: string): Promise<Profile> {
+  return postProfile("/api/v1/me/two-factor/totp/confirm", { code });
+}
+
+export async function fetchAvatarBlob(): Promise<Blob | null> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me/avatar`, {
+      headers: authHeaders(),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    const payload = await readJson(response);
+    throw authError(response, payload);
+  }
+  return response.blob();
+}
+
+export async function logout(): Promise<void> {
+  try {
+    await fetch(`${apiBaseUrl()}/api/v1/auth/logout`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+  } catch {
+    // Clearing the local token still ends this browser session.
+  } finally {
+    setAccessToken(null);
+  }
+}
+
+export const AUTH_FAILURE_MESSAGES: Record<AuthFailureKind, string> = {
+  network: "Could not reach the assistant. Check that the backend is running.",
+  invalid_request: "Check the details you entered and try again.",
+  conflict: "An account with this email already exists. Log in instead.",
+  not_found: "No account was found for that email. Sign up first.",
+  unauthenticated: "That sign-in is no longer valid. Request a new code.",
+  mail_failed: "The verification email could not be sent. Try again shortly.",
+  rate_limited: "Too many attempts. Wait a minute and try again.",
+  unexpected: "Something went wrong. Please try again.",
+};
+
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/me/password`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    });
+  } catch {
+    throw new AuthApiError("network");
+  }
+  if (!response.ok) {
+    throw authError(response, await readJson(response));
+  }
+}
