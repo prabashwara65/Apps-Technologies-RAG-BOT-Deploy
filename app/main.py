@@ -20,15 +20,12 @@ from app.core.exceptions import (
 )
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import CorrelationIdMiddleware
-from app.core.storage import configure_storage, ensure_avatars_dir
 from app.core.rate_limit import FixedWindowRateLimiter, RateLimitPolicy
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create a validated, independently testable Phase 0 application."""
     active_settings = settings or get_settings()
-    configure_storage(active_settings.uploads_root)
-    ensure_avatars_dir()
     configure_logging(active_settings.log_level)
 
     application = FastAPI(
